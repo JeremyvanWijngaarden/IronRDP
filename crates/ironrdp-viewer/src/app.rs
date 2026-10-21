@@ -46,6 +46,8 @@ pub struct RpcApp {
     frame_wakeup: Option<Arc<AtomicBool>>,
     context: softbuffer::Context<DisplayHandle<'static>>,
     initial_window_size: PhysicalSize<u32>,
+    /// Title, icon, WM class, … of the session window; the size is set on creation.
+    window_attributes: WindowAttributes,
     window: Option<WindowSurface>,
     buffer: Vec<u32>,
     buffer_size: (u16, u16),
@@ -68,6 +70,15 @@ impl App {
                 initial_window_size,
             )?,
         })
+    }
+
+    /// Replaces the default attributes (title "IronRDP") of the session window.
+    ///
+    /// The inner size is always the negotiated desktop size.
+    #[must_use]
+    pub fn with_window_attributes(mut self, window_attributes: WindowAttributes) -> Self {
+        self.inner.window_attributes = window_attributes;
+        self
     }
 }
 
@@ -108,6 +119,7 @@ impl RpcApp {
             frame_wakeup,
             context,
             initial_window_size,
+            window_attributes: WindowAttributes::default().with_title("IronRDP"),
             window: None,
             buffer: Vec::new(),
             buffer_size: (0, 0),
@@ -221,9 +233,7 @@ impl RpcApp {
     }
 
     fn on_resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window_attributes = WindowAttributes::default()
-            .with_title("IronRDP")
-            .with_inner_size(self.initial_window_size);
+        let window_attributes = self.window_attributes.clone().with_inner_size(self.initial_window_size);
         match event_loop.create_window(window_attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
