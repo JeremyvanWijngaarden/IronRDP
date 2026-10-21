@@ -72,9 +72,9 @@ struct Args {
 
     #[clap(long, value_parser)]
     gw_endpoint: Option<String>,
-    #[clap(long, value_parser)]
+    #[clap(long, value_parser, env = "RDP_GW_USERNAME")]
     gw_user: Option<String>,
-    #[clap(long, value_parser)]
+    #[clap(long, value_parser, env = "RDP_GW_PASSWORD", hide_env_values = true)]
     gw_pass: Option<String>,
 
     /// An address on which the client will connect.
@@ -526,13 +526,14 @@ fn apply_cli_to_builder(
             endpoint,
             prefer_direct: false,
         });
+    }
 
-        if let Some(username) = args.gw_user {
-            builder = builder.with_gateway_username(username);
-        }
-        if let Some(password) = args.gw_pass {
-            builder = builder.with_gateway_password(password);
-        }
+    // Gateway credentials also apply to a gateway configured by the `.rdp` file.
+    if let Some(username) = args.gw_user {
+        builder = builder.with_gateway_username(username);
+    }
+    if let Some(password) = args.gw_pass {
+        builder = builder.with_gateway_password(password);
     }
 
     builder = builder.with_clipboard(resolve_clipboard_type(args.clipboard_type, redirect_clipboard));
