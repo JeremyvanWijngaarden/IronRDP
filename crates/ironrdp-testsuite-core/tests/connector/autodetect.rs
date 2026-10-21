@@ -9,8 +9,13 @@
 
 use std::borrow::Cow;
 
+use std::sync::Arc;
+
 use ironrdp_connector::MonotonicInstant;
-use ironrdp_connector::{ClientConnector, ClientConnectorState, Sequence as _, Written};
+use ironrdp_connector::{
+    ClientConnector, ClientConnectorState, ConnectorResult, LicenseCache, LicenseExchangeSequence, Sequence as _,
+    Written,
+};
 use ironrdp_core::{WriteBuf, encode_vec};
 use ironrdp_pdu::mcs::{McsMessage, SendDataIndication};
 use ironrdp_pdu::rdp::autodetect::{
@@ -18,8 +23,8 @@ use ironrdp_pdu::rdp::autodetect::{
 };
 use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
 use ironrdp_pdu::rdp::server_license::{
-    LicenseErrorCode, LicenseHeader, LicensePdu, LicensingErrorMessage, LicensingStateTransition, PreambleFlags,
-    PreambleType, PreambleVersion,
+    LicenseErrorCode, LicenseHeader, LicenseInformation, LicensePdu, LicensingErrorMessage, LicensingStateTransition,
+    PreambleFlags, PreambleType, PreambleVersion,
 };
 use ironrdp_pdu::x224::X224;
 
@@ -515,4 +520,80 @@ fn connect_time_bandwidth_second_start_discards_the_first_window() {
         results.1, 1552,
         "the 4096 bytes counted before the second Start are discarded; only the second window's Payload and Stop, each with an 8-byte header, remain"
     );
+}
+
+#[derive(Debug)]
+struct NoCache;
+
+impl LicenseCache for NoCache {
+    fn get_license(&self, _: LicenseInformation) -> ConnectorResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn store_license(&self, _: LicenseInformation) -> ConnectorResult<()> {
+        Ok(())
+    }
+}
+
+/// Windows keeps sending Auto-Detect Requests on the message channel after the
+/// connect-time phase, for instance right after a reconnect while licensing is
+/// still in progress. Decoding one as a licensing PDU fails on its security
+/// header flags, so the phases that own the I/O channel answer it in place.
+#[test]
+fn autodetect_request_during_licensing_is_answered_and_licensing_continues() {
+    let mut connector = connect_time_autodetect_connector();
+    connector.state = ClientConnectorState::LicensingExchange {
+        io_channel_id: IO_CHANNEL_ID,
+        user_channel_id: USER_CHANNEL_ID,
+        license_exchange: LicenseExchangeSequence::new(
+            IO_CHANNEL_ID,
+            "user".to_owned(),
+            None,
+            [0; 4],
+            Arc::new(NoCache),
+        ),
+    };
+
+    let user_data = encode_vec(&AutoDetectReqPdu::new(AutoDetectRequest::rtt_connect_time(0x4242))).unwrap();
+    let mut output = WriteBuf::new();
+    let written = connector
+        .step(
+            &server_send_data_indication(MESSAGE_CHANNEL_ID, user_data),
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+    assert!(written.size().is_some(), "the RTT request is answered");
+    assert!(matches!(
+        connector.state,
+        ClientConnectorState::LicensingExchange { .. }
+    ));
+}
+
+#[test]
+fn autodetect_request_during_multitransport_bootstrapping_is_answered() {
+    let mut connector = connect_time_autodetect_connector();
+    connector.state = ClientConnectorState::MultitransportBootstrapping {
+        io_channel_id: IO_CHANNEL_ID,
+        user_channel_id: USER_CHANNEL_ID,
+        message_channel_id: Some(MESSAGE_CHANNEL_ID),
+        requests_seen: 0,
+    };
+
+    let user_data = encode_vec(&AutoDetectReqPdu::new(AutoDetectRequest::bw_stop_continuous(0x4343))).unwrap();
+    let mut output = WriteBuf::new();
+    let written = connector
+        .step(
+            &server_send_data_indication(MESSAGE_CHANNEL_ID, user_data),
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+    assert!(written.size().is_some(), "the continuous Stop is answered");
+    assert!(matches!(
+        connector.state,
+        ClientConnectorState::MultitransportBootstrapping { .. }
+    ));
 }

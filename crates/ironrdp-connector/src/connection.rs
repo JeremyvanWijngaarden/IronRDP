@@ -847,6 +847,43 @@ impl ClientConnector {
         }
     }
 
+    /// Answers an Auto-Detect Request that arrived on the message channel while another phase
+    /// (licensing, multitransport bootstrapping) owns the I/O channel.
+    ///
+    /// Windows keeps running network detection on the message channel after the connect-time
+    /// phase ([MS-RDPBCGR] 1.3.8), so such a PDU is not a protocol error for the phase in progress.
+    /// Returns `None` when `input` is not a message-channel PDU, so the caller handles it as usual.
+    fn answer_message_channel_autodetect(
+        &mut self,
+        input: &[u8],
+        received_at: Option<MonotonicInstant>,
+        user_channel_id: u16,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Option<Written>> {
+        let Some(message_channel_id) = self.message_channel_id else {
+            return Ok(None);
+        };
+        let request = match decode::<X224<mcs::McsMessage<'_>>>(input) {
+            Ok(X224(mcs::McsMessage::SendDataIndication(data))) if data.channel_id == message_channel_id => {
+                decode::<rdp::autodetect::AutoDetectReqPdu>(&data.user_data).ok()
+            }
+            _ => return Ok(None),
+        };
+        match request {
+            Some(pdu) => self
+                .respond_to_connect_time_autodetect(
+                    pdu.request,
+                    received_at,
+                    message_channel_id,
+                    user_channel_id,
+                    output,
+                )
+                .map(Some),
+            // Another message-channel PDU that is not this phase's business either.
+            None => Ok(Some(Written::Nothing)),
+        }
+    }
+
     fn respond_to_connect_time_autodetect(
         &mut self,
         request: rdp::autodetect::AutoDetectRequest,
@@ -1428,15 +1465,28 @@ impl Sequence for ClientConnector {
             } => {
                 debug!("Licensing Exchange");
 
-                advance_licensing_exchange(
-                    license_exchange,
-                    io_channel_id,
-                    user_channel_id,
-                    self.message_channel_id,
-                    input,
-                    received_at,
-                    output,
-                )?
+                if let Some(written) =
+                    self.answer_message_channel_autodetect(input, received_at, user_channel_id, output)?
+                {
+                    (
+                        written,
+                        ClientConnectorState::LicensingExchange {
+                            io_channel_id,
+                            user_channel_id,
+                            license_exchange,
+                        },
+                    )
+                } else {
+                    advance_licensing_exchange(
+                        license_exchange,
+                        io_channel_id,
+                        user_channel_id,
+                        self.message_channel_id,
+                        input,
+                        received_at,
+                        output,
+                    )?
+                }
             }
 
             //== Optional Multitransport Bootstrapping ==//
@@ -1462,10 +1512,9 @@ impl Sequence for ClientConnector {
             } => {
                 let ctx = mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
 
-                if Some(ctx.channel_id) == message_channel_id {
-                    let pdu = decode::<rdp::multitransport::MultitransportRequestPdu>(ctx.user_data)
-                        .map_err(ConnectorError::decode)?;
-
+                if Some(ctx.channel_id) == message_channel_id
+                    && let Ok(pdu) = decode::<rdp::multitransport::MultitransportRequestPdu>(ctx.user_data)
+                {
                     if requests_seen >= MAX_MULTITRANSPORT_REQUESTS {
                         return Err(reason_err!(
                             "MultitransportBootstrapping",
@@ -1496,6 +1545,21 @@ impl Sequence for ClientConnector {
                             request: pdu,
                             requests_seen: requests_seen + 1,
                             soft_sync,
+                        },
+                    )
+                } else if Some(ctx.channel_id) == message_channel_id {
+                    // Not a multitransport request: network detection keeps running on
+                    // the message channel and is answered in place.
+                    let written = self
+                        .answer_message_channel_autodetect(input, received_at, user_channel_id, output)?
+                        .unwrap_or(Written::Nothing);
+                    (
+                        written,
+                        ClientConnectorState::MultitransportBootstrapping {
+                            io_channel_id,
+                            user_channel_id,
+                            message_channel_id,
+                            requests_seen,
                         },
                     )
                 } else if ctx.channel_id == io_channel_id {
