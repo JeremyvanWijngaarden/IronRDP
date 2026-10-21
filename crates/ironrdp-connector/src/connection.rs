@@ -856,8 +856,8 @@ impl ClientConnector {
         output: &mut WriteBuf,
     ) -> ConnectorResult<Written> {
         use ironrdp_pdu::rdp::autodetect::{
-            AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONNECT_TIME, BW_START_CONNECT_TIME,
-            BW_STOP_CONNECT_TIME,
+            AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONNECT_TIME, BW_RESULTS_CONTINUOUS,
+            BW_START_CONNECT_TIME, BW_STOP_CONNECT_TIME,
         };
 
         match request {
@@ -959,25 +959,30 @@ impl ClientConnector {
                 let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
                 Written::from_size(written)
             }
-            // A Stop reaching here with any other requestType means a nonconformant
-            // server. [MS-RDPBCGR] 2.2.14.1.4 scopes 0x0429-via-Auto-Detect-Request-PDU
-            // to after the RDP Connection Sequence has completed, so during connect-time
-            // detection the only legitimate form on this channel is 0x002B, matched
-            // above; 0x0429 as a tunneled Sub-Header and 0x0629 both belong to a
-            // multitransport channel this step never sees. No reply is owed here per
-            // spec, but silently dropping it leaves nothing to debug a stalled
-            // connection with, so it is noted rather than swallowed like the truly
-            // expected continuous variants below.
+            // Windows servers also send the continuous-phase Stop (0x0429) on the main
+            // channel before the connection sequence has completed. [MS-RDPBCGR] 2.2.14.1.4
+            // scopes that form to after the sequence, but the server still blocks until it
+            // receives a Bandwidth Measure Results reply, so not answering stalls the whole
+            // connection at licensing. FreeRDP answers every Stop with the CONTINUOUS
+            // response type (libfreerdp/core/autodetect.c); do the same. No window is
+            // opened by the 0x0014 Start on this path, so report an empty measurement.
             AutoDetectRequest::BandwidthMeasureStop {
                 sequence_number,
                 request_type,
                 ..
             } => {
-                warn!(
+                debug!(
                     sequence_number,
-                    request_type, "Unexpected Bandwidth Measure Stop requestType during connect-time auto-detection"
+                    request_type, "Continuous Bandwidth Measure Stop during connect-time auto-detection; replying"
                 );
-                Ok(Written::Nothing)
+                let response = AutoDetectRspPdu::new(AutoDetectResponse::BandwidthMeasureResults {
+                    sequence_number,
+                    response_type: BW_RESULTS_CONTINUOUS,
+                    time_delta_ms: UNMEASURABLE_INTERVAL_MS,
+                    byte_count: 0,
+                });
+                let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
+                Written::from_size(written)
             }
             // The Network Characteristics Result is informational; nothing to send.
             //

@@ -13,7 +13,9 @@ use ironrdp_connector::MonotonicInstant;
 use ironrdp_connector::{ClientConnector, ClientConnectorState, Sequence as _, Written};
 use ironrdp_core::{WriteBuf, encode_vec};
 use ironrdp_pdu::mcs::{McsMessage, SendDataIndication};
-use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu};
+use ironrdp_pdu::rdp::autodetect::{
+    AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONTINUOUS,
+};
 use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
 use ironrdp_pdu::rdp::server_license::{
     LicenseErrorCode, LicenseHeader, LicensePdu, LicensingErrorMessage, LicensingStateTransition, PreambleFlags,
@@ -382,24 +384,19 @@ fn connect_time_bandwidth_measured_window_reports_every_payload() {
     );
 }
 
-/// Continuous detection is not this phase's business. Its Starts and Stops belong
-/// to a different procedure in [MS-RDPBCGR] 3.2.5.14, answered on a multitransport
-/// channel, and the 0x0629 Stop needs a sequence-number correlation this phase
-/// does not track. A continuous Start must therefore not open a connect-time
-/// window, and a continuous Stop must not be answered as though it had.
-///
-/// The header size follows the same split: 2.2.14.1.4 sets `headerLength` to 0x08
-/// only for the 0x002B Stop and 0x06 otherwise, so counting a continuous Stop with
-/// the connect-time addend would be wrong on top of replying to it at all.
+/// Windows servers send a continuous-phase Start/Payload/Stop (0x0014, 0x0002,
+/// 0x0429) on the main channel before the connection sequence has completed,
+/// and block until the Stop is answered. The Start and Payload need no reply
+/// and must not open a connect-time window, but the Stop is answered with the
+/// CONTINUOUS response type and the unmeasured floor, as FreeRDP does.
 #[test]
-fn continuous_bandwidth_measure_requests_are_not_answered_as_connect_time() {
+fn continuous_bandwidth_measure_stop_is_answered_as_continuous() {
     let mut connector = connect_time_autodetect_connector();
     let mut output = WriteBuf::new();
 
     for request in [
         AutoDetectRequest::bw_start_continuous(0x6666),
         AutoDetectRequest::bw_payload(0x6666, vec![0u8; 1024]),
-        AutoDetectRequest::bw_stop_continuous(0x6666),
     ] {
         output.clear();
         let written = connector
@@ -413,13 +410,44 @@ fn continuous_bandwidth_measure_requests_are_not_answered_as_connect_time() {
         assert_eq!(
             written,
             Written::Nothing,
-            "a continuous-detection request produces no connect-time reply"
+            "a continuous Start or Payload produces no reply"
         );
     }
 
+    output.clear();
+    let stop = encode_vec(&AutoDetectReqPdu::new(AutoDetectRequest::bw_stop_continuous(0x6666))).unwrap();
+    let written = connector
+        .step(
+            &server_send_data_indication(MESSAGE_CHANNEL_ID, stop),
+            Some(MonotonicInstant::from_millis(3_250)),
+            &mut output,
+        )
+        .unwrap();
+
+    assert!(
+        written.size().is_some(),
+        "the server blocks until the continuous Stop is answered"
+    );
+    let X224(McsMessage::SendDataRequest(send_data)) = ironrdp_core::decode(output.filled()).unwrap() else {
+        panic!("expected a SendDataRequest in the response frame");
+    };
+    let response = ironrdp_core::decode::<AutoDetectRspPdu>(&send_data.user_data).unwrap();
+    assert!(
+        matches!(
+            response.response,
+            AutoDetectResponse::BandwidthMeasureResults {
+                sequence_number: 0x6666,
+                response_type: BW_RESULTS_CONTINUOUS,
+                time_delta_ms: 1,
+                byte_count: 0,
+            }
+        ),
+        "unexpected response {:?}",
+        response.response
+    );
     assert!(
         matches!(connector.state, ClientConnectorState::ConnectTimeAutoDetection { .. }),
-        "the connector keeps listening after ignoring continuous-detection requests"
+        "the connector keeps listening after answering the continuous Stop"
     );
 }
 
