@@ -391,6 +391,13 @@ impl ViewerConfig {
         prompt_missing(self.builder, dump)
     }
 
+    /// Advertise the local monitor layout to the server ([MS-RDPBCGR] 2.2.1.3.6).
+    #[must_use]
+    pub fn with_monitor_layout(mut self, monitor_layout: ironrdp::pdu::gcc::ClientMonitorData) -> Self {
+        self.builder = self.builder.with_monitor_layout(monitor_layout);
+        self
+    }
+
     /// Path to the log file requested on the CLI, if any.
     pub fn log_file(&self) -> Option<&str> {
         self.log_file.as_deref()
