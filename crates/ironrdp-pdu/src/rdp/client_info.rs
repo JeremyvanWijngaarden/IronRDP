@@ -41,6 +41,9 @@ const CLIENT_DIR_LENGTH_SIZE: usize = 2;
 const SESSION_ID_SIZE: usize = 4;
 const PERFORMANCE_FLAGS_SIZE: usize = 4;
 const RECONNECT_COOKIE_LENGTH_SIZE: usize = 2;
+const RESERVED_SIZE: usize = 2;
+const DYNAMIC_DST_KEY_NAME_LENGTH_SIZE: usize = 2;
+const DYNAMIC_DAYLIGHT_TIME_DISABLED_SIZE: usize = 2;
 const BIAS_SIZE: usize = 4;
 
 /// [2.2.1.11.1.1] Info Packet (TS_INFO_PACKET)
@@ -462,7 +465,21 @@ pub struct ExtendedClientOptionalInfo {
     performance_flags: Option<PerformanceFlags>,
     reconnect_cookie: Option<[u8; RECONNECT_COOKIE_LEN]>,
     auto_reconnect: Option<ClientAutoReconnect>,
-    // other fields are read by RdpVersion::Ten+
+    dynamic_dst: Option<DynamicDstTimezone>,
+}
+
+/// The dynamic DST fields at the end of the Extended Info Packet ([MS-RDPBCGR] 2.2.1.11.1.1.1):
+/// `cbDynamicDSTTimeZoneKeyName`, `dynamicDSTTimeZoneKeyName` and `dynamicDaylightTimeDisabled`.
+///
+/// Windows Server validates these fields and refuses the connection with
+/// `ERRINFO_TIMEZONE_KEY_NAME_LENGTH_TOO_SHORT` (0x1135) when they are absent, so a client
+/// should always send them, even with an empty key name.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct DynamicDstTimezone {
+    /// Windows time zone key name such as `W. Europe Standard Time`; may be empty.
+    pub key_name: String,
+    pub daylight_time_disabled: bool,
 }
 
 impl fmt::Debug for ExtendedClientOptionalInfo {
@@ -478,6 +495,7 @@ impl fmt::Debug for ExtendedClientOptionalInfo {
             .field("session_id", &self.session_id)
             .field("performance_flags", &self.performance_flags)
             .field("auto_reconnect", &self.auto_reconnect)
+            .field("dynamic_dst", &self.dynamic_dst)
             .finish_non_exhaustive()
     }
 }
@@ -514,6 +532,10 @@ impl ExtendedClientOptionalInfo {
     pub fn auto_reconnect(&self) -> Option<&ClientAutoReconnect> {
         self.auto_reconnect.as_ref()
     }
+
+    pub fn dynamic_dst(&self) -> Option<&DynamicDstTimezone> {
+        self.dynamic_dst.as_ref()
+    }
 }
 
 impl Encode for ExtendedClientOptionalInfo {
@@ -532,6 +554,17 @@ impl Encode for ExtendedClientOptionalInfo {
         if let Some(reconnect_cookie) = self.reconnect_cookie {
             dst.write_u16(u16::try_from(RECONNECT_COOKIE_LEN).expect("RECONNECT_COOKIE_LEN fit into u16"));
             dst.write_array(reconnect_cookie);
+        } else if self.dynamic_dst.is_some() {
+            // cbAutoReconnectLen: no cookie, but the fields after it are present.
+            dst.write_u16(0);
+        }
+        if let Some(ref dynamic_dst) = self.dynamic_dst {
+            dst.write_u16(0); // reserved1
+            dst.write_u16(0); // reserved2
+            let key_name = utils::to_utf16_bytes(&dynamic_dst.key_name);
+            dst.write_u16(cast_length!("cbDynamicDSTTimeZoneKeyName", key_name.len())?);
+            dst.write_slice(&key_name);
+            dst.write_u16(u16::from(dynamic_dst.daylight_time_disabled));
         }
 
         Ok(())
@@ -555,6 +588,14 @@ impl Encode for ExtendedClientOptionalInfo {
         }
         if self.reconnect_cookie.is_some() {
             size += RECONNECT_COOKIE_LENGTH_SIZE + RECONNECT_COOKIE_LEN;
+        } else if self.dynamic_dst.is_some() {
+            size += RECONNECT_COOKIE_LENGTH_SIZE;
+        }
+        if let Some(ref dynamic_dst) = self.dynamic_dst {
+            size += RESERVED_SIZE * 2
+                + DYNAMIC_DST_KEY_NAME_LENGTH_SIZE
+                + utils::encoded_str_len(&dynamic_dst.key_name, CharacterSet::Unicode, false)
+                + DYNAMIC_DAYLIGHT_TIME_DISABLED_SIZE;
         }
 
         size
@@ -606,6 +647,25 @@ impl<'de> Decode<'de> for ExtendedClientOptionalInfo {
         }
         src.read_u16(); // reserved1
         src.read_u16(); // reserved2
+
+        if src.len() < DYNAMIC_DST_KEY_NAME_LENGTH_SIZE {
+            return Ok(optional_data);
+        }
+        let key_name_len = usize::from(src.read_u16());
+        if key_name_len % 2 != 0 || src.len() < key_name_len {
+            return Err(invalid_field_err!(
+                "cbDynamicDSTTimeZoneKeyName",
+                "invalid dynamic DST time zone key name length",
+                in: src
+            ));
+        }
+        let key_name = utils::from_utf16_bytes(src.read_slice(key_name_len));
+        // Lenient like FreeRDP: a missing trailing flag means "not disabled".
+        let daylight_time_disabled = src.len() >= DYNAMIC_DAYLIGHT_TIME_DISABLED_SIZE && src.read_u16() != 0;
+        optional_data.dynamic_dst = Some(DynamicDstTimezone {
+            key_name,
+            daylight_time_disabled,
+        });
 
         Ok(optional_data)
     }
@@ -990,13 +1050,15 @@ pub mod builder {
     use ironrdp_core::{Decode as _, ReadCursor};
 
     use super::{
-        ClientAutoReconnect, ExtendedClientOptionalInfo, PerformanceFlags, RECONNECT_COOKIE_LEN, TimezoneInfo,
+        ClientAutoReconnect, DynamicDstTimezone, ExtendedClientOptionalInfo, PerformanceFlags, RECONNECT_COOKIE_LEN,
+        TimezoneInfo,
     };
 
     pub struct ExtendedClientOptionalInfoBuilderStateSetTimeZone;
     pub struct ExtendedClientOptionalInfoBuilderStateSetSessionId;
     pub struct ExtendedClientOptionalInfoBuilderStateSetPerformanceFlags;
     pub struct ExtendedClientOptionalInfoBuilderStateSetReconnectCookie;
+    pub struct ExtendedClientOptionalInfoBuilderStateSetDynamicDst;
     pub struct ExtendedClientOptionalInfoBuilderStateFinal;
 
     // State machine-based builder for [`ExtendedClientOptionalInfo`].
@@ -1071,9 +1133,34 @@ pub mod builder {
         pub fn reconnect_cookie(
             mut self,
             reconnect_cookie: [u8; RECONNECT_COOKIE_LEN],
-        ) -> ExtendedClientOptionalInfoBuilder<ExtendedClientOptionalInfoBuilderStateFinal> {
+        ) -> ExtendedClientOptionalInfoBuilder<ExtendedClientOptionalInfoBuilderStateSetDynamicDst> {
             self.inner.auto_reconnect = ClientAutoReconnect::decode(&mut ReadCursor::new(&reconnect_cookie)).ok();
             self.inner.reconnect_cookie = Some(reconnect_cookie);
+            ExtendedClientOptionalInfoBuilder {
+                inner: self.inner,
+                _phantom_data: Default::default(),
+            }
+        }
+
+        /// No auto-reconnect cookie (a fresh connection): `cbAutoReconnectLen` is written as 0.
+        pub fn dynamic_dst(
+            mut self,
+            dynamic_dst: DynamicDstTimezone,
+        ) -> ExtendedClientOptionalInfoBuilder<ExtendedClientOptionalInfoBuilderStateFinal> {
+            self.inner.dynamic_dst = Some(dynamic_dst);
+            ExtendedClientOptionalInfoBuilder {
+                inner: self.inner,
+                _phantom_data: Default::default(),
+            }
+        }
+    }
+
+    impl ExtendedClientOptionalInfoBuilder<ExtendedClientOptionalInfoBuilderStateSetDynamicDst> {
+        pub fn dynamic_dst(
+            mut self,
+            dynamic_dst: DynamicDstTimezone,
+        ) -> ExtendedClientOptionalInfoBuilder<ExtendedClientOptionalInfoBuilderStateFinal> {
+            self.inner.dynamic_dst = Some(dynamic_dst);
             ExtendedClientOptionalInfoBuilder {
                 inner: self.inner,
                 _phantom_data: Default::default(),
@@ -1084,9 +1171,9 @@ pub mod builder {
 
 #[cfg(test)]
 mod tests {
-    use ironrdp_core::{Decode as _, ReadCursor, decode, encode_vec};
+    use ironrdp_core::{Decode as _, Encode as _, ReadCursor, decode, encode_vec};
 
-    use super::{ClientAutoReconnect, ExtendedClientOptionalInfo, PerformanceFlags, TimezoneInfo};
+    use super::{ClientAutoReconnect, DynamicDstTimezone, ExtendedClientOptionalInfo, PerformanceFlags, TimezoneInfo};
 
     fn reconnect_cookie() -> [u8; 28] {
         let mut cookie = [0; 28];
@@ -1133,6 +1220,7 @@ mod tests {
             performance_flags: Some(PerformanceFlags::default()),
             reconnect_cookie: Some(cookie),
             auto_reconnect: Some(parsed.clone()),
+            dynamic_dst: None,
         };
 
         // 0xA5 renders as `165` in the derived byte-slice output.
@@ -1157,6 +1245,7 @@ mod tests {
             performance_flags: Some(PerformanceFlags::default()),
             reconnect_cookie: Some(reconnect_cookie),
             auto_reconnect: None,
+            dynamic_dst: None,
         };
 
         let decoded: ExtendedClientOptionalInfo = decode(&encode_vec(&optional_info).unwrap()).unwrap();
@@ -1177,5 +1266,54 @@ mod tests {
             optional_info.auto_reconnect().map(|packet| packet.logon_id),
             Some(0x1234_5678)
         );
+    }
+
+    #[test]
+    fn dynamic_dst_without_cookie_round_trips() {
+        let optional_info = ExtendedClientOptionalInfo::builder()
+            .timezone(TimezoneInfo::default())
+            .session_id(0)
+            .performance_flags(PerformanceFlags::empty())
+            .dynamic_dst(DynamicDstTimezone {
+                key_name: "AB".to_owned(),
+                daylight_time_disabled: true,
+            })
+            .build();
+
+        let encoded = encode_vec(&optional_info).unwrap();
+        assert_eq!(
+            &encoded[encoded.len() - 14..],
+            [
+                0x00, 0x00, // cbAutoReconnectLen = 0
+                0x00, 0x00, // reserved1
+                0x00, 0x00, // reserved2
+                0x04, 0x00, // cbDynamicDSTTimeZoneKeyName = 4
+                b'A', 0x00, b'B', 0x00, // dynamicDSTTimeZoneKeyName, no null terminator
+                0x01, 0x00, // dynamicDaylightTimeDisabled
+            ]
+        );
+        assert_eq!(encoded.len(), optional_info.size());
+
+        let decoded: ExtendedClientOptionalInfo = decode(&encoded).unwrap();
+        assert_eq!(decoded, optional_info);
+    }
+
+    #[test]
+    fn dynamic_dst_after_cookie_round_trips() {
+        let optional_info = ExtendedClientOptionalInfo::builder()
+            .timezone(TimezoneInfo::default())
+            .session_id(0)
+            .performance_flags(PerformanceFlags::empty())
+            .reconnect_cookie(reconnect_cookie())
+            .dynamic_dst(DynamicDstTimezone::default())
+            .build();
+
+        let encoded = encode_vec(&optional_info).unwrap();
+        assert_eq!(encoded.len(), optional_info.size());
+        assert_eq!(&encoded[encoded.len() - 8..], [0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let decoded: ExtendedClientOptionalInfo = decode(&encoded).unwrap();
+        assert_eq!(decoded.dynamic_dst(), Some(&DynamicDstTimezone::default()));
+        assert_eq!(decoded.auto_reconnect().map(|p| p.logon_id), Some(0x1234_5678));
     }
 }

@@ -1850,7 +1850,7 @@ fn create_client_info_pdu(
     use ironrdp_pdu::rdp::ClientInfoPdu;
     use ironrdp_pdu::rdp::client_info::{
         AddressFamily, ClientAutoReconnect, ClientInfo, ClientInfoFlags, CompressionType, Credentials,
-        ExtendedClientInfo, ExtendedClientOptionalInfo,
+        DynamicDstTimezone, ExtendedClientInfo, ExtendedClientOptionalInfo,
     };
     use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
 
@@ -1932,11 +1932,17 @@ fn create_client_info_pdu(
                 // Resuming a session: prove we held the cookie the server issued
                 // for it ([MS-RDPBCGR] 2.2.4.3, derived per 5.5). Absent on a
                 // fresh connection, which is an ordinary logon.
+                // Windows Server refuses the connection (ERRINFO_TIMEZONE_KEY_NAME_LENGTH_TOO_SHORT)
+                // when the Extended Info Packet stops before the dynamic DST fields, so always
+                // send them. The key name stays empty: the time zone sent above is the default
+                // too, and the server falls back to it.
+                let dynamic_dst = DynamicDstTimezone::default();
                 match auto_reconnect_cookie {
                     Some(cookie) => builder
                         .reconnect_cookie(ClientAutoReconnect::from_server_cookie(cookie).to_bytes())
+                        .dynamic_dst(dynamic_dst)
                         .build(),
-                    None => builder.build(),
+                    None => builder.dynamic_dst(dynamic_dst).build(),
                 }
             },
         },
