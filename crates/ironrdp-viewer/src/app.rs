@@ -49,6 +49,8 @@ pub struct RpcApp {
     /// Title, icon, WM class, … of the session window; the size is set on creation.
     window_attributes: WindowAttributes,
     window: Option<WindowSurface>,
+    /// Why the session never got going or ended abnormally, for embedders to report.
+    connection_error: Option<String>,
     buffer: Vec<u32>,
     buffer_size: (u16, u16),
     input_database: ironrdp::input::Database,
@@ -79,6 +81,11 @@ impl App {
     pub fn with_window_attributes(mut self, window_attributes: WindowAttributes) -> Self {
         self.inner.window_attributes = window_attributes;
         self
+    }
+
+    /// The connection or session error that made the event loop exit, if any.
+    pub fn connection_error(&self) -> Option<&str> {
+        self.inner.connection_error.as_deref()
     }
 }
 
@@ -120,6 +127,7 @@ impl RpcApp {
             context,
             initial_window_size,
             window_attributes: WindowAttributes::default().with_title("IronRDP"),
+            connection_error: None,
             window: None,
             buffer: Vec::new(),
             buffer_size: (0, 0),
@@ -522,6 +530,7 @@ impl RpcApp {
             RdpOutputEvent::ConnectionFailure(error) => {
                 error!(?error);
                 eprintln!("Connection error: {}", error.report().with_locations());
+                self.connection_error = Some(error.report().to_string());
                 // TODO set proc_exit::sysexits::PROTOCOL_ERR.as_raw());
                 event_loop.exit();
             }
@@ -534,6 +543,7 @@ impl RpcApp {
                     Err(error) => {
                         error!(?error);
                         eprintln!("Active session error: {}", error.report().with_locations());
+                        self.connection_error = Some(error.report().to_string());
                         proc_exit::sysexits::PROTOCOL_ERR
                     }
                 };
