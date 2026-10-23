@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use ironrdp_core::WriteBuf;
 use ironrdp_pdu::PduHint;
+use ironrdp_pdu::rdp::headers::{ShareControlHeader, ShareControlPdu, ShareDataPdu};
+use ironrdp_pdu::rdp::server_error_info::ServerSetErrorInfoPdu;
 use ironrdp_pdu::rdp::server_license::{self, LicenseInformation, LicensePdu, ServerLicenseError};
 use rand::RngCore as _;
 use tracing::{debug, error, info, trace};
 
-use super::{ConnectorError, ConnectorErrorExt as _, custom_err, general_err};
+use super::{ConnectorError, ConnectorErrorExt as _, custom_err, general_err, reason_err};
 use crate::{
     ConnectorResult, ConnectorResultExt as _, MonotonicInstant, Sequence, State, Written, encode_send_data_request,
 };
@@ -135,6 +137,23 @@ impl Sequence for LicenseExchangeSequence {
             LicenseExchangeState::NewLicenseRequest => {
                 let send_data_indication_ctx =
                     ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
+
+                // A server that rejects the Client Info PDU answers with a Set Error Info PDU
+                // instead of the Server License Request; report its reason instead of a
+                // licensing decode error.
+                if let Ok(ShareControlHeader {
+                    share_control_pdu: ShareControlPdu::Data(header),
+                    ..
+                }) = send_data_indication_ctx.decode_user_data::<ShareControlHeader>()
+                    && let ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error_info)) = header.share_data_pdu
+                {
+                    return Err(reason_err!(
+                        "ServerSetErrorInfo",
+                        "server refused the connection before licensing: {}",
+                        error_info.description()
+                    ));
+                }
+
                 let license_pdu = send_data_indication_ctx
                     .decode_user_data::<LicensePdu>()
                     .map_err(ConnectorError::decode)
