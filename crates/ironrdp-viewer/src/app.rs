@@ -248,7 +248,15 @@ impl RpcApp {
                 if matches!(&self.input_target, InputTarget::Rpc(_)) {
                     window.set_cursor_visible(false);
                 }
-                let surface = softbuffer::Surface::new(&self.context, Arc::clone(&window)).expect("surface");
+                let mut surface = softbuffer::Surface::new(&self.context, Arc::clone(&window)).expect("surface");
+                // Wayland maps a window only once it has content: show black until the first frame.
+                let size = window.inner_size();
+                if let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                    surface.resize(width, height).expect("surface resize");
+                    let mut buffer = surface.buffer_mut().expect("surface buffer");
+                    buffer.fill(0);
+                    buffer.present().expect("buffer present");
+                }
                 self.window = Some((window, surface));
             }
             Err(error) => {
